@@ -93,7 +93,6 @@ class NSQFrameDecoder extends FrameDecoder with Slf4jLogger {
     }
 
     private def sendNOP(implicit channel:Channel){
-        println("send NOP")
         write(Nop)
     }
 

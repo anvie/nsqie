@@ -45,6 +45,7 @@ case class NsqSubscriber(name:String, nameLong:String,
             val client = NsqClient(producerHost, name, nameLong, rdyCount)
             client.listeners :+= new RestartListener {
                 override def apply(nsq: NsqClient) {
+                    debug("listener called by " + nsq)
 //                    client.listeners.clear()
                     restart()
                     listen(callback)
@@ -85,9 +86,9 @@ case class NsqSubscriber(name:String, nameLong:String,
         val resp:HttpResponse = Await.result(
             httpClient(RequestBuilder().url("http://" + lookupHost + "/lookup?topic=" + topic).buildGet()))
 
-        debug("nsqd resp: " + resp)
+//        debug("nsqd resp: " + resp)
         val content = resp.getContent.toString(CharsetUtil.UTF_8)
-        debug("content: " + content)
+//        debug("content: " + content)
         val json = parse(content)
         var producers = ArrayBuffer.empty[String]
         for {
@@ -188,13 +189,14 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
     def identify(data:String) = {
         val bf = ByteBuffer.allocate(13 + 4 + data.getBytes.length).order(ByteOrder.BIG_ENDIAN)
 
-        bf.put("  V2IDENTIFY\n".getBytes)
+        bf.put("  V2".getBytes)
+        bf.put("IDENTIFY\n".getBytes)
         bf.putInt(data.length)
         bf.put(data.getBytes)
 
         val payload = new String(bf.array())
         debug("payload: " + payload)
-        Await.result(client(payload)) match {
+        Await.result(client(payload), 15.seconds) match {
             case OK =>
                 connected = true
                 debug("connected: " + connected)
@@ -216,24 +218,6 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
         client(payload)
     }
 
-//    def reset(){
-//        connected = false
-//        inited = false
-//        client.close()
-//        client = buildClient()
-//
-//        client("  V2").onSuccess { data => data match {
-//                case OK =>
-//                    connected = true
-//                    debug("connected: " + connected)
-//                    if (retrier != null){
-//                        retrier.run()
-//                    }
-//                case x =>
-//                    error("cannot identify, returned from nsqd: " + x)
-//            }
-//        }
-//    }
 
     private def identifyInternal(){
         identify("""{"short_id":"%s","long_id":"%s"}""".format(shortId, longId))
@@ -292,12 +276,6 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
     def nop()(implicit ctx:SubscribeContext){
         _dispatch(NOP + "\n")
             .onSuccess(feed)
-            .onFailure {
-                case e =>
-                    error(e.getMessage)
-                    inited = false
-                    ensureInit()
-            }
     }
 
     private def buildClient() = {

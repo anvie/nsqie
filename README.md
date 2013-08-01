@@ -4,13 +4,16 @@ Example Usage
 -----------------
 
 ```scala
-val nsq = NsqClient.create("MindtalkClient", "MindtalkClientApp",
-    "localhost:4161", "mindtalk")
+val nsq = NsqSubscriber("Mindtalk", "MindtalkApp",
+    "127.0.0.1:4161", "mindtalk", "nsqie")
 
-nsq.subscribe("mindtalk", "nsqie"){ case (topic, channel, msg) =>
+nsq.listen { case (topic, channel, msg) =>
     println("got data %s from topic %s in channel %s".format(msg, topic, channel))
     MessageHandleReturn.SUCCESS
 }
+
+NsqClient.publish("127.0.0.1:4151", "mindtalk",
+    "hello " + System.currentTimeMillis() + " :P")
 ```
 
 Under heavy development, don't use this in production.
