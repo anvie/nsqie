@@ -60,11 +60,11 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
         .codec(NSQCodec)
         .hosts(new InetSocketAddress(host, port))
         .retryPolicy(RetryPolicy.backoff(Backoff.exponential(1 seconds, 2) take 15) {
-        case Throw(x: WriteException) => true
-        case Throw(x) =>
-            error("connection failed, e: " + x)
-            true
-    })
+            case Throw(x: WriteException) => true
+            case Throw(x) =>
+                error("connection failed, e: " + x)
+                true
+        })
         .hostConnectionLimit(1)
         .build()
 
