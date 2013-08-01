@@ -1,7 +1,7 @@
 package com.ansvia.nsqie
 
 import com.twitter.finagle.builder.ClientBuilder
-import com.twitter.finagle.{WriteException, Service}
+import com.twitter.finagle.{ChannelClosedException, WriteException, Service}
 import java.net.InetSocketAddress
 import com.twitter.finagle.service.{Backoff, RetryPolicy}
 import com.twitter.conversions.time._
@@ -14,7 +14,9 @@ import net.liftweb.json._
 import com.twitter.util.Throw
 import scala.collection.mutable.ArrayBuffer
 import net.liftweb.json.JsonAST.{JInt, JString}
-import org.jboss.netty.handler.codec.http.HttpResponse
+import org.jboss.netty.handler.codec.http.{HttpRequest, HttpResponse}
+import org.jboss.netty.buffer.ChannelBuffers
+import scala.collection.mutable
 
 /**
  * Author: robin
@@ -26,7 +28,7 @@ import org.jboss.netty.handler.codec.http.HttpResponse
 // factory
 object NsqClient extends Slf4jLogger {
     def create(name:String, longName:String, lookupHost:String, topic:String) = {
-        val httpClient = HttpClient.createClient(lookupHost)
+        val httpClient: Service[HttpRequest, HttpResponse] = HttpClient.createClient(lookupHost)
 
         val resp:HttpResponse = Await.result(
             httpClient(RequestBuilder().url("http://" + lookupHost + "/lookup?topic=" + topic).buildGet()))
@@ -44,7 +46,32 @@ object NsqClient extends Slf4jLogger {
         }
         debug("producers of %s: %s".format(topic, producers.toList))
 
+        httpClient.close()
         NsqClient(producers.toList.head, name, longName, 1000)
+    }
+
+    private val httpClientsPoll = new
+            mutable.HashMap[String, Service[HttpRequest, HttpResponse]]()
+        with mutable.SynchronizedMap[String, Service[HttpRequest, HttpResponse]]
+
+    def publish(host:String, topic:String, data:String){
+        synchronized {
+            val httpClient = httpClientsPoll.getOrElseUpdate(host,
+                HttpClient.createClient(host))
+            val buff = ChannelBuffers.buffer(data.getBytes.length)
+            buff.writeBytes(data.getBytes)
+            httpClient(RequestBuilder().url("http://%s/put?topic=%s".format(host, topic))
+                .buildPost(buff))
+        }
+    }
+
+    def cleanup(){
+        synchronized {
+            for ( c <- httpClientsPoll.values ){
+                c.close()
+            }
+            httpClientsPoll.clear()
+        }
     }
 }
 
@@ -61,6 +88,7 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
         .hosts(new InetSocketAddress(host, port))
         .retryPolicy(RetryPolicy.backoff(Backoff.exponential(1 seconds, 2) take 15) {
             case Throw(x: WriteException) => true
+            case Throw(x: ChannelClosedException) => true
             case Throw(x) =>
                 error("connection failed, e: " + x)
                 true
@@ -75,6 +103,9 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
     case class SubscribeContext(topic:String, channel:String, mh:MessageHandler)
 
     import NsqCommands._
+
+    def publish(host:String, topic:String, data:String) =
+        NsqClient.publish(host, topic, data)
 
     def subscribe[T](topic:String, channel:String)(implicit mh:MessageHandler){
         ensureInit()
