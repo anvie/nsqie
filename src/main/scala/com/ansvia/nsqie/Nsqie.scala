@@ -5,18 +5,18 @@ import com.twitter.finagle.{FailedFastException, ChannelClosedException, WriteEx
 import java.net.InetSocketAddress
 import com.twitter.finagle.service.{Backoff, RetryPolicy}
 import com.twitter.conversions.time._
-import com.twitter.util.Await
+import com.twitter.util.{Time, Await, Throw}
 import java.nio.{ByteOrder, ByteBuffer}
 import com.ansvia.commons.logging.Slf4jLogger
 import com.twitter.finagle.http.RequestBuilder
 import org.jboss.netty.util.CharsetUtil
 import net.liftweb.json._
-import com.twitter.util.Throw
-import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.{ListBuffer, ArrayBuffer}
 import net.liftweb.json.JsonAST.{JInt, JString}
 import org.jboss.netty.handler.codec.http.{HttpRequest, HttpResponse}
 import org.jboss.netty.buffer.ChannelBuffers
 import scala.collection.mutable
+import com.twitter.finagle.util.DefaultTimer
 
 /**
  * Author: robin
@@ -25,11 +25,63 @@ import scala.collection.mutable
  *
  */
 
-// factory
-object NsqClient extends Slf4jLogger {
-    def create(name:String, longName:String, lookupHost:String, topic:String) = {
-        val httpClient: Service[HttpRequest, HttpResponse] = HttpClient.createClient(lookupHost)
 
+
+case class NsqSubscriber(name:String, nameLong:String,
+                    lookupHost:String, topic:String, channel:String,
+                    rdyCount:Int=1000) extends Slf4jLogger {
+
+    import NsqClient.MessageHandler
+
+    lazy val httpClient: Service[HttpRequest, HttpResponse] = HttpClient.createClient(lookupHost)
+    var nsqClient:NsqClient = _
+    var callback:MessageHandler = _
+    private val timer = DefaultTimer.twitter
+    restart()
+
+    def getClient(topic:String) = {
+
+        lookup(topic).headOption.map { producerHost =>
+            val client = NsqClient(producerHost, name, nameLong, rdyCount)
+            client.listeners :+= new RestartListener {
+                override def apply(nsq: NsqClient) {
+//                    client.listeners.clear()
+                    restart()
+                    listen(callback)
+                }
+            }
+            client
+        }
+
+    }
+
+    def listen[T](implicit func: MessageHandler){
+        callback = func
+//        assert(nsqClient != null, "nsq client not initialized (no producers?)")
+        if (nsqClient == null){
+            // wait until nsq client get connected
+            timer.schedule(Time.now + 5.seconds){
+                listen(func)
+            }
+        }else{
+            nsqClient.subscribe(topic, channel)
+        }
+    }
+
+    def restart(){
+        if (nsqClient != null){
+            nsqClient.close()
+            nsqClient = null
+        }
+        getClient(topic).map(nsqClient = _)
+        .getOrElse {
+            timer.schedule(Time.now + 3.seconds){
+                restart()
+            }
+        }
+    }
+
+    def lookup(topic:String) = {
         val resp:HttpResponse = Await.result(
             httpClient(RequestBuilder().url("http://" + lookupHost + "/lookup?topic=" + topic).buildGet()))
 
@@ -44,14 +96,37 @@ object NsqClient extends Slf4jLogger {
         }{
             producers :+= producerHost + ":" + producerPort
         }
-        debug("producers of %s: %s".format(topic, producers.toList))
-
-        httpClient.close()
-        NsqClient(producers.toList.head, name, longName, 1000)
+        val rv = producers.toList
+        debug("producers of %s: %s".format(topic, rv))
+        rv
     }
 
-    private val httpClientsPoll = new
-            mutable.HashMap[String, Service[HttpRequest, HttpResponse]]()
+    def close(){
+        httpClient.close()
+        if (nsqClient != null){
+            nsqClient.close()
+            nsqClient = null
+        }
+    }
+}
+
+abstract class NsqListener {
+    def apply(nsq:NsqClient)
+}
+
+abstract class RestartListener() extends NsqListener
+
+
+object NsqClient extends Slf4jLogger {
+
+
+    /**
+     * (topic, channel, msg)
+     */
+    type MessageHandler = (String, String, NSQMessage) => Int
+    case class SubscribeContext(topic:String, channel:String, mh:MessageHandler)
+
+    private val httpClientsPoll = new mutable.HashMap[String, Service[HttpRequest, HttpResponse]]()
         with mutable.SynchronizedMap[String, Service[HttpRequest, HttpResponse]]
 
     def publish(host:String, topic:String, data:String){
@@ -75,6 +150,7 @@ object NsqClient extends Slf4jLogger {
     }
 }
 
+
 case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:Int) extends Slf4jLogger {
 
     @volatile
@@ -85,34 +161,23 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
     private val port = s(1).toInt
     private var inited = false
     var connected = false
-    private var retrier:Runnable = _
+    var listeners = ListBuffer.empty[NsqListener]
 
-    private var client:Service[String, Object] = buildClient()
+    private val client: Service[String, Object] = buildClient()
 
-    /**
-     * (topic, channel, msg)
-     */
-    type MessageHandler = (String, String, NSQMessage) => Int
-    case class SubscribeContext(topic:String, channel:String, mh:MessageHandler)
 
+    import NsqClient.MessageHandler
+    import NsqClient.SubscribeContext
     import NsqCommands._
 
-    def publish(host:String, topic:String, data:String) =
-        NsqClient.publish(host, topic, data)
+//    def publish(host:String, topic:String, data:String) =
+//        NsqClient.publish(host, topic, data)
 
     def subscribe[T](topic:String, channel:String)(implicit mh:MessageHandler){
         ensureInit()
         _dispatch(SUB + " " + topic + " " + channel + "\n").onSuccess {
             case OK =>
                 implicit val ctx = SubscribeContext(topic, channel, mh)
-                if (retrier == null){
-                    retrier = new Runnable {
-                        def run() {
-                            debug("retrying...")
-                            subscribe(topic, channel)(mh)
-                        }
-                    }
-                }
                 rdy(_rdyCount).onSuccess(feed)
             case x =>
                 error("cannot subscribe. returned from nsqd: " + x)
@@ -151,24 +216,24 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
         client(payload)
     }
 
-    private def reset(){
-        connected = false
-        inited = false
-        client.close()
-        client = buildClient()
-
-        client("  V2").onSuccess { data => data match {
-                case OK =>
-                    connected = true
-                    debug("connected: " + connected)
-                    if (retrier != null){
-                        retrier.run()
-                    }
-                case x =>
-                    error("cannot identify, returned from nsqd: " + x)
-            }
-        }
-    }
+//    def reset(){
+//        connected = false
+//        inited = false
+//        client.close()
+//        client = buildClient()
+//
+//        client("  V2").onSuccess { data => data match {
+//                case OK =>
+//                    connected = true
+//                    debug("connected: " + connected)
+//                    if (retrier != null){
+//                        retrier.run()
+//                    }
+//                case x =>
+//                    error("cannot identify, returned from nsqd: " + x)
+//            }
+//        }
+//    }
 
     private def identifyInternal(){
         identify("""{"short_id":"%s","long_id":"%s"}""".format(shortId, longId))
@@ -243,7 +308,13 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
                 case Throw(x: WriteException) => true
                 case Throw(x) =>
                     error("connection failed, e: " + x.getMessage)
-                    reset()
+                    listeners.foreach { lst =>
+                        lst match {
+                            case listener:RestartListener =>
+                                listener(this)
+                            case _ =>
+                        }
+                    }
                     false
             })
             .hostConnectionLimit(1)
@@ -251,7 +322,11 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
             .build()
     }
 
-
+    def close(){
+        if (client != null){
+            client.close()
+        }
+    }
 }
 
 
