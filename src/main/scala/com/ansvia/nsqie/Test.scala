@@ -1,6 +1,5 @@
 package com.ansvia.nsqie
 
-import net.liftweb.json._
 
 object Test {
 
