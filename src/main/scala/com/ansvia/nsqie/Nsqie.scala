@@ -5,9 +5,16 @@ import com.twitter.finagle.{WriteException, Service}
 import java.net.InetSocketAddress
 import com.twitter.finagle.service.{Backoff, RetryPolicy}
 import com.twitter.conversions.time._
-import com.twitter.util.{Await, Throw}
+import com.twitter.util.Await
 import java.nio.{ByteOrder, ByteBuffer}
 import com.ansvia.commons.logging.Slf4jLogger
+import com.twitter.finagle.http.RequestBuilder
+import org.jboss.netty.util.CharsetUtil
+import net.liftweb.json._
+import com.twitter.util.Throw
+import scala.collection.mutable.ArrayBuffer
+import net.liftweb.json.JsonAST.{JInt, JString}
+import org.jboss.netty.handler.codec.http.HttpResponse
 
 /**
  * Author: robin
@@ -15,6 +22,31 @@ import com.ansvia.commons.logging.Slf4jLogger
  * Time: 2:51 PM
  *
  */
+
+// factory
+object NsqClient extends Slf4jLogger {
+    def create(name:String, longName:String, lookupHost:String, topic:String) = {
+        val httpClient = HttpClient.createClient(lookupHost)
+
+        val resp:HttpResponse = Await.result(
+            httpClient(RequestBuilder().url("http://" + lookupHost + "/lookup?topic=" + topic).buildGet()))
+
+        debug("nsqd resp: " + resp)
+        val content = resp.getContent.toString(CharsetUtil.UTF_8)
+        debug("content: " + content)
+        val json = parse(content)
+        var producers = ArrayBuffer.empty[String]
+        for {
+            JField("broadcast_address", JString(producerHost)) <- json
+            JField("tcp_port", JInt(producerPort)) <- json
+        }{
+            producers :+= producerHost + ":" + producerPort
+        }
+        debug("producers of %s: %s".format(topic, producers.toList))
+
+        NsqClient(producers.toList.head, name, longName, 1000)
+    }
+}
 
 case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:Int) extends Slf4jLogger {
 
