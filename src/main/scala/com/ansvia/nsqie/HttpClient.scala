@@ -11,7 +11,7 @@ import com.twitter.finagle.http.Http
  * Time: 11:56 PM
  *
  */
-object HttpClient {
+private[nsqie] object HttpClient {
 
     def createClient(hosts:String, connLimit:Int=1):Service[HttpRequest, HttpResponse] =
         ClientBuilder()
