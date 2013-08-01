@@ -1,7 +1,7 @@
 package com.ansvia.nsqie
 
 import com.twitter.finagle.builder.ClientBuilder
-import com.twitter.finagle.{ChannelClosedException, WriteException, Service}
+import com.twitter.finagle.{FailedFastException, ChannelClosedException, WriteException, Service}
 import java.net.InetSocketAddress
 import com.twitter.finagle.service.{Backoff, RetryPolicy}
 import com.twitter.conversions.time._
@@ -83,18 +83,11 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
     private val s = hostNPort.split(":")
     private val host = s(0)
     private val port = s(1).toInt
-    lazy val client:Service[String, Object] = ClientBuilder()
-        .codec(NSQCodec)
-        .hosts(new InetSocketAddress(host, port))
-        .retryPolicy(RetryPolicy.backoff(Backoff.exponential(1 seconds, 2) take 15) {
-            case Throw(x: WriteException) => true
-            case Throw(x: ChannelClosedException) => true
-            case Throw(x) =>
-                error("connection failed, e: " + x)
-                true
-        })
-        .hostConnectionLimit(1)
-        .build()
+    private var inited = false
+    var connected = false
+    private var retrier:Runnable = _
+
+    private var client:Service[String, Object] = buildClient()
 
     /**
      * (topic, channel, msg)
@@ -109,25 +102,22 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
 
     def subscribe[T](topic:String, channel:String)(implicit mh:MessageHandler){
         ensureInit()
-
         _dispatch(SUB + " " + topic + " " + channel + "\n").onSuccess {
             case OK =>
                 implicit val ctx = SubscribeContext(topic, channel, mh)
-                _dispatch("RDY %d\n".format(_rdyCount)).onSuccess(feed)
+                if (retrier == null){
+                    retrier = new Runnable {
+                        def run() {
+                            debug("retrying...")
+                            subscribe(topic, channel)(mh)
+                        }
+                    }
+                }
+                rdy(_rdyCount).onSuccess(feed)
             case x =>
                 error("cannot subscribe. returned from nsqd: " + x)
         }
 
-    }
-
-    def handler:PartialFunction[String, Unit] = {
-        case HEARTBEAT =>
-            println("sending NOP")
-            client(NOP + "\n")
-            throw new SkipException
-        case "OK" =>
-            throw new SkipException
-        case _ =>
     }
 
     def identify(data:String) = {
@@ -141,12 +131,15 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
         debug("payload: " + payload)
         Await.result(client(payload)) match {
             case OK =>
+                connected = true
+                debug("connected: " + connected)
             case x =>
                 error("cannot identify, returned from nsqd: " + x)
         }
     }
 
     private def _dispatch(cmd:String, data:Option[String]=None)={
+        ensureInit()
         var payload = cmd
         data.map { d =>
             val bf = ByteBuffer.allocate(d.length + 6).order(ByteOrder.BIG_ENDIAN)
@@ -158,11 +151,33 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
         client(payload)
     }
 
-    private var inited = false
+    private def reset(){
+        connected = false
+        inited = false
+        client.close()
+        client = buildClient()
+
+        client("  V2").onSuccess { data => data match {
+                case OK =>
+                    connected = true
+                    debug("connected: " + connected)
+                    if (retrier != null){
+                        retrier.run()
+                    }
+                case x =>
+                    error("cannot identify, returned from nsqd: " + x)
+            }
+        }
+    }
+
+    private def identifyInternal(){
+        identify("""{"short_id":"%s","long_id":"%s"}""".format(shortId, longId))
+    }
+
     private def ensureInit(){
         if (!inited){
 
-            identify("""{"short_id":"%s","long_id":"%s"}""".format(shortId, longId))
+            identifyInternal()
 
             inited = true
         }
@@ -205,9 +220,38 @@ case class NsqClient(hostNPort:String, shortId:String, longId:String, rdyCount:I
         _dispatch(REQ + " " + msg.id + " 100\n").onSuccess(feed)
     }
 
-    def nop()(implicit ctx:SubscribeContext){
-        _dispatch(NOP + "\n").onSuccess(feed)
+    def rdy(count:Int)(implicit ctx:SubscribeContext) = {
+        _dispatch("RDY %d\n".format(count))
     }
+
+    def nop()(implicit ctx:SubscribeContext){
+        _dispatch(NOP + "\n")
+            .onSuccess(feed)
+            .onFailure {
+                case e =>
+                    error(e.getMessage)
+                    inited = false
+                    ensureInit()
+            }
+    }
+
+    private def buildClient() = {
+        ClientBuilder()
+            .codec(NSQCodec)
+            .hosts(new InetSocketAddress(host, port))
+            .retryPolicy(RetryPolicy.backoff(Backoff.exponential(1 seconds, 2) take 15) {
+                case Throw(x: WriteException) => true
+                case Throw(x) =>
+                    error("connection failed, e: " + x.getMessage)
+                    reset()
+                    false
+            })
+            .hostConnectionLimit(1)
+//            .timeout(15 seconds)
+            .build()
+    }
+
+
 }
 
 
